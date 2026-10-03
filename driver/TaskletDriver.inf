@@ -1,0 +1,50 @@
+;
+; TaskletDriver.inf
+; Native Kernel Telemetry Monitor Driver
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = SecurityEvaluation
+ClassGuid   = {b613a7b6-f08a-4467-8772-a1691901a520}
+Provider    = %ManufacturerName%
+CatalogFile = TaskletTelemetry.cat
+DriverVer   = 10/03/2026,1.0.0.1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+TaskletTelemetry.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%TaskletDriver.DeviceDesc% = TaskletDriver_Device, Root\TaskletTelemetry
+
+[TaskletDriver_Device.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+TaskletTelemetry.sys
+
+[TaskletDriver_Device.NT.Services]
+AddService = TaskletTelemetry,%SPSVCINST_ASSOCSERVICE%,TaskletDriver_Service_Inst
+
+[TaskletDriver_Service_Inst]
+DisplayName    = %TaskletDriver.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\TaskletTelemetry.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "Tasklet Security Team"
+DiskName               = "Tasklet Driver Installation Disk"
+TaskletDriver.DeviceDesc = "Tasklet Native Kernel Telemetry Monitor"
+TaskletDriver.SVCDESC  = "Tasklet Kernel Telemetry Service"

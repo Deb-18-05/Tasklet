@@ -1,0 +1,1582 @@
+﻿#define UNICODE
+#define _UNICODE
+
+#include <windows.h>
+#include <commctrl.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <cwctype>
+
+#include "tasklet.h"
+
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "psapi.lib")
+
+// ============================================================
+// TASKLET NATIVE UI
+// ============================================================
+
+static HWND g_main   = nullptr;
+static HWND g_nav    = nullptr;
+static HWND g_list   = nullptr;
+static HWND g_search = nullptr;
+static HWND g_status = nullptr;
+static HWND g_refresh = nullptr;
+
+static HFONT g_font = nullptr;
+
+static std::vector<ProcessInfo> g_processes;
+
+// PID -> ListView row
+static std::unordered_map<uint32_t, int> g_rows;
+
+// Last search string. Search changes are allowed to rebuild
+// the visible table. Normal telemetry refreshes are not.
+static std::wstring g_previous_search;
+// ============================================================
+// STRING HELPERS
+// ============================================================
+
+static std::wstring to_wide(const std::string& text)
+{
+    if (text.empty())
+        return L"";
+
+    int needed = MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        text.c_str(),
+        -1,
+        nullptr,
+        0
+    );
+
+    if (needed <= 0)
+        return L"";
+
+    std::wstring result(
+        static_cast<size_t>(needed - 1),
+        L'\0'
+    );
+
+    MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        text.c_str(),
+        -1,
+        result.data(),
+        needed
+    );
+
+    return result;
+}
+
+static std::wstring lower_copy(
+    std::wstring value
+)
+{
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](wchar_t c)
+        {
+            return static_cast<wchar_t>(
+                towlower(c)
+            );
+        }
+    );
+
+    return value;
+}
+
+static bool matches_search(
+    const ProcessInfo& process,
+    const std::wstring& query
+)
+{
+    if (query.empty())
+        return true;
+
+    std::wstring name =
+        lower_copy(
+            to_wide(process.name)
+        );
+
+    std::wstring q =
+        lower_copy(query);
+
+    return name.find(q) !=
+           std::wstring::npos;
+}
+
+static std::wstring get_search_text()
+{
+    if (!g_search)
+        return L"";
+
+    int length =
+        GetWindowTextLengthW(g_search);
+
+    if (length <= 0)
+        return L"";
+
+    std::wstring result(
+        static_cast<size_t>(length),
+        L'\0'
+    );
+
+    GetWindowTextW(
+        g_search,
+        result.data(),
+        length + 1
+    );
+
+    return result;
+}
+
+// ============================================================
+// FORMATTING
+// ============================================================
+
+static std::wstring format_memory(
+    uint64_t bytes
+)
+{
+    wchar_t buffer[64]{};
+
+    if (bytes >=
+        1024ULL * 1024ULL * 1024ULL)
+    {
+        swprintf_s(
+            buffer,
+            L"%.1f GB",
+            static_cast<double>(bytes) /
+            (1024.0 * 1024.0 * 1024.0)
+        );
+    }
+    else if (bytes >=
+             1024ULL * 1024ULL)
+    {
+        swprintf_s(
+            buffer,
+            L"%.1f MB",
+            static_cast<double>(bytes) /
+            (1024.0 * 1024.0)
+        );
+    }
+    else if (bytes >= 1024ULL)
+    {
+        swprintf_s(
+            buffer,
+            L"%.1f KB",
+            static_cast<double>(bytes) /
+            1024.0
+        );
+    }
+    else
+    {
+        swprintf_s(
+            buffer,
+            L"%llu B",
+            static_cast<unsigned long long>(
+                bytes
+            )
+        );
+    }
+
+    return buffer;
+}
+
+static std::wstring format_cpu(
+    double cpu
+)
+{
+    wchar_t buffer[64]{};
+
+    swprintf_s(
+        buffer,
+        L"%.1f%%",
+        cpu
+    );
+
+    return buffer;
+}
+
+// ============================================================
+// LISTVIEW LOW LEVEL
+// ============================================================
+
+static int list_count()
+{
+    return static_cast<int>(
+        SendMessageW(
+            g_list,
+            LVM_GETITEMCOUNT,
+            0,
+            0
+        )
+    );
+}
+
+static void list_set_text(
+    int row,
+    int column,
+    const std::wstring& text
+)
+{
+    LVITEMW item{};
+
+    item.iSubItem = column;
+    item.pszText =
+        const_cast<LPWSTR>(
+            text.c_str()
+        );
+
+    SendMessageW(
+        g_list,
+        LVM_SETITEMTEXTW,
+        static_cast<WPARAM>(row),
+        reinterpret_cast<LPARAM>(&item)
+    );
+}
+
+static int list_insert(
+    int row,
+    const std::wstring& text
+)
+{
+    LVITEMW item{};
+
+    item.mask = LVIF_TEXT;
+    item.iItem = row;
+    item.iSubItem = 0;
+    item.pszText =
+        const_cast<LPWSTR>(
+            text.c_str()
+        );
+
+    return static_cast<int>(
+        SendMessageW(
+            g_list,
+            LVM_INSERTITEMW,
+            0,
+            reinterpret_cast<LPARAM>(&item)
+        )
+    );
+}
+
+static void list_insert_column(
+    int index,
+    const wchar_t* title,
+    int width
+)
+{
+    LVCOLUMNW column{};
+
+    column.mask =
+        LVCF_TEXT |
+        LVCF_WIDTH |
+        LVCF_SUBITEM;
+
+    column.cx = width;
+    column.iSubItem = index;
+    column.pszText =
+        const_cast<LPWSTR>(title);
+
+    SendMessageW(
+        g_list,
+        LVM_INSERTCOLUMNW,
+        static_cast<WPARAM>(index),
+        reinterpret_cast<LPARAM>(&column)
+    );
+}
+
+static uint32_t list_get_pid(
+    int row
+)
+{
+    wchar_t buffer[64]{};
+
+    LVITEMW item{};
+
+    item.iSubItem = 1;
+    item.pszText = buffer;
+    item.cchTextMax = 64;
+
+    SendMessageW(
+        g_list,
+        LVM_GETITEMTEXTW,
+        static_cast<WPARAM>(row),
+        reinterpret_cast<LPARAM>(&item)
+    );
+
+    return static_cast<uint32_t>(
+        wcstoul(
+            buffer,
+            nullptr,
+            10
+        )
+    );
+}
+
+static int find_row(
+    uint32_t pid
+)
+{
+    auto it = g_rows.find(pid);
+
+    if (it == g_rows.end())
+        return -1;
+
+    return it->second;
+}
+
+// ============================================================
+// UPDATE ONE ROW
+// ============================================================
+
+static void update_row(
+    int row,
+    const ProcessInfo& p
+)
+{
+    list_set_text(
+        row,
+        0,
+        to_wide(p.name)
+    );
+
+    list_set_text(
+        row,
+        1,
+        std::to_wstring(p.pid)
+    );
+
+    list_set_text(
+        row,
+        2,
+        std::to_wstring(p.parent_pid)
+    );
+
+    list_set_text(
+        row,
+        3,
+        format_cpu(p.cpu_percent)
+    );
+
+    list_set_text(
+        row,
+        4,
+        format_memory(p.memory_bytes)
+    );
+
+    list_set_text(
+        row,
+        5,
+        to_wide(p.state)
+    );
+}
+
+// ============================================================
+// CURRENT VIEW
+// ============================================================
+
+static uint32_t get_selected_pid()
+{
+    int row =
+        static_cast<int>(
+            SendMessageW(
+                g_list,
+                LVM_GETNEXTITEM,
+                static_cast<WPARAM>(-1),
+                LVNI_SELECTED
+            )
+        );
+
+    if (row < 0)
+        return 0;
+
+    return list_get_pid(row);
+}
+
+static int get_top_index()
+{
+    return static_cast<int>(
+        SendMessageW(
+            g_list,
+            LVM_GETTOPINDEX,
+            0,
+            0
+        )
+    );
+}
+
+// ============================================================
+// FULL FILTER REBUILD
+//
+// This ONLY happens when the search query changes.
+// It does NOT happen every second.
+// ============================================================
+
+static void rebuild_filtered_view()
+{
+    uint32_t selectedPid =
+        get_selected_pid();
+
+    SendMessageW(
+        g_list,
+        WM_SETREDRAW,
+        FALSE,
+        0
+    );
+
+    SendMessageW(
+        g_list,
+        LVM_DELETEALLITEMS,
+        0,
+        0
+    );
+
+    g_rows.clear();
+
+    std::wstring query =
+        get_search_text();
+
+    int row = 0;
+
+    for (const auto& process : g_processes)
+    {
+        if (!matches_search(
+                process,
+                query))
+        {
+            continue;
+        }
+
+        int inserted =
+            list_insert(
+                row,
+                to_wide(process.name)
+            );
+
+        if (inserted < 0)
+            continue;
+
+        update_row(
+            inserted,
+            process
+        );
+
+        g_rows[process.pid] =
+            inserted;
+
+        ++row;
+    }
+
+    SendMessageW(
+        g_list,
+        WM_SETREDRAW,
+        TRUE,
+        0
+    );
+
+    InvalidateRect(
+        g_list,
+        nullptr,
+        FALSE
+    );
+
+    if (selectedPid != 0)
+    {
+        int selectedRow =
+            find_row(selectedPid);
+
+        if (selectedRow >= 0)
+        {
+            LVITEMW state{};
+
+            state.stateMask =
+                LVIS_SELECTED |
+                LVIS_FOCUSED;
+
+            state.state =
+                LVIS_SELECTED |
+                LVIS_FOCUSED;
+
+            SendMessageW(
+                g_list,
+                LVM_SETITEMSTATE,
+                static_cast<WPARAM>(
+                    selectedRow
+                ),
+                reinterpret_cast<LPARAM>(
+                    &state
+                )
+            );
+
+            SendMessageW(
+                g_list,
+                LVM_ENSUREVISIBLE,
+                static_cast<WPARAM>(
+                    selectedRow
+                ),
+                FALSE
+            );
+        }
+    }
+}
+
+// ============================================================
+// INITIAL TABLE
+// ============================================================
+
+static void build_initial_view()
+{
+    SendMessageW(
+        g_list,
+        WM_SETREDRAW,
+        FALSE,
+        0
+    );
+
+    SendMessageW(
+        g_list,
+        LVM_DELETEALLITEMS,
+        0,
+        0
+    );
+
+    g_rows.clear();
+
+    int row = 0;
+
+    for (const auto& process : g_processes)
+    {
+        int inserted =
+            list_insert(
+                row,
+                to_wide(process.name)
+            );
+
+        if (inserted < 0)
+            continue;
+
+        update_row(
+            inserted,
+            process
+        );
+
+        g_rows[process.pid] =
+            inserted;
+
+        ++row;
+    }
+
+    SendMessageW(
+        g_list,
+        WM_SETREDRAW,
+        TRUE,
+        0
+    );
+
+    InvalidateRect(
+        g_list,
+        nullptr,
+        FALSE
+    );
+}
+
+// ============================================================
+// IN-PLACE TELEMETRY REFRESH
+//
+// This is the important part.
+//
+// Existing rows remain exactly where they are.
+// We only change cell text.
+//
+// Therefore:
+//   scrollbar = stable
+//   scroll position = stable
+//   selection = stable
+//   mouse position = stable
+// ============================================================
+
+static void refresh_processes()
+{
+    uint32_t selectedPid =
+        get_selected_pid();
+
+    std::vector<ProcessInfo> fresh =
+        enumerate_processes();
+
+    std::unordered_map<uint32_t, bool>
+        freshPids;
+
+    for (const auto& process : fresh)
+        freshPids[process.pid] = true;
+
+    // --------------------------------------------------------
+    // Determine whether process membership changed.
+    // --------------------------------------------------------
+
+    bool membershipChanged =
+        freshPids.size() !=
+        g_rows.size();
+
+    if (!membershipChanged)
+    {
+        for (const auto& process : fresh)
+        {
+            if (g_rows.find(process.pid) ==
+                g_rows.end())
+            {
+                membershipChanged = true;
+                break;
+            }
+        }
+    }
+
+    // --------------------------------------------------------
+    // If processes appeared/disappeared, update membership.
+    // Do NOT rebuild the entire table.
+    // --------------------------------------------------------
+
+    if (membershipChanged)
+    {
+        // Remove dead processes.
+        for (int row =
+             list_count() - 1;
+             row >= 0;
+             --row)
+        {
+            uint32_t pid =
+                list_get_pid(row);
+
+            if (freshPids.find(pid) ==
+                freshPids.end())
+            {
+                SendMessageW(
+                    g_list,
+                    LVM_DELETEITEM,
+                    static_cast<WPARAM>(row),
+                    0
+                );
+            }
+        }
+
+        // Re-index existing rows.
+        g_rows.clear();
+
+        for (int row = 0;
+             row < list_count();
+             ++row)
+        {
+            g_rows[
+                list_get_pid(row)
+            ] = row;
+        }
+
+        // Add new processes at the bottom.
+        for (const auto& process : fresh)
+        {
+            if (g_rows.find(process.pid) !=
+                g_rows.end())
+            {
+                continue;
+            }
+
+            int row =
+                list_insert(
+                    list_count(),
+                    to_wide(process.name)
+                );
+
+            if (row < 0)
+                continue;
+
+            update_row(
+                row,
+                process
+            );
+
+            g_rows[process.pid] =
+                row;
+        }
+
+        // Re-index once more after additions.
+        g_rows.clear();
+
+        for (int row = 0;
+             row < list_count();
+             ++row)
+        {
+            g_rows[
+                list_get_pid(row)
+            ] = row;
+        }
+    }
+
+    // --------------------------------------------------------
+    // Update existing rows IN PLACE.
+    // --------------------------------------------------------
+
+    for (const auto& process : fresh)
+    {
+        int row =
+            find_row(process.pid);
+
+        if (row < 0)
+            continue;
+
+        if (!matches_search(
+                process,
+                get_search_text()))
+        {
+            continue;
+        }
+
+        update_row(
+            row,
+            process
+        );
+    }
+
+    // --------------------------------------------------------
+    // If search changed, rebuild filtered membership once.
+    // --------------------------------------------------------
+
+    std::wstring currentSearch =
+        get_search_text();
+
+    if (currentSearch !=
+        g_previous_search)
+    {
+        g_previous_search =
+            currentSearch;
+
+        g_processes =
+            std::move(fresh);
+
+        rebuild_filtered_view();
+    }
+    else
+    {
+        g_processes =
+            std::move(fresh);
+    }
+
+    // Restore selected process.
+    if (selectedPid != 0)
+    {
+        int row =
+            find_row(selectedPid);
+
+        if (row >= 0)
+        {
+            LVITEMW state{};
+
+            state.stateMask =
+                LVIS_SELECTED |
+                LVIS_FOCUSED;
+
+            state.state =
+                LVIS_SELECTED |
+                LVIS_FOCUSED;
+
+            SendMessageW(
+                g_list,
+                LVM_SETITEMSTATE,
+                static_cast<WPARAM>(row),
+                reinterpret_cast<LPARAM>(
+                    &state
+                )
+            );
+        }
+    }
+
+    wchar_t status[256]{};
+
+    swprintf_s(
+        status,
+        L"%zu processes    |    "
+        L"Live update: 1 s    |    "
+        L"Native Tasklet engine",
+        g_processes.size()
+    );
+
+    SetWindowTextW(
+        g_status,
+        status
+    );
+}
+
+// ============================================================
+// END PROCESS
+// ============================================================
+
+static void end_selected_process(
+    HWND owner
+)
+{
+    uint32_t pid =
+        get_selected_pid();
+
+    if (pid == 0)
+        return;
+
+    if (pid == GetCurrentProcessId())
+    {
+        MessageBoxW(
+            owner,
+            L"Tasklet cannot terminate itself.",
+            L"Tasklet",
+            MB_OK |
+            MB_ICONINFORMATION
+        );
+
+        return;
+    }
+
+    int answer =
+        MessageBoxW(
+            owner,
+            L"Terminate the selected process?",
+            L"End Process",
+            MB_YESNO |
+            MB_ICONWARNING
+        );
+
+    if (answer != IDYES)
+        return;
+
+    if (!terminate_process(pid))
+    {
+        MessageBoxW(
+            owner,
+            L"Tasklet could not terminate the process.",
+            L"End Process",
+            MB_OK |
+            MB_ICONERROR
+        );
+
+        return;
+    }
+
+    refresh_processes();
+}
+
+// ============================================================
+// NAVIGATION BUTTON
+// ============================================================
+
+static HWND make_nav_button(
+    HWND parent,
+    const wchar_t* text,
+    int id,
+    int y
+)
+{
+    HWND button =
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            text,
+            WS_CHILD |
+            WS_VISIBLE |
+            BS_PUSHBUTTON |
+            BS_FLAT,
+            12,
+            y,
+            170,
+            42,
+            parent,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(id)
+            ),
+            nullptr,
+            nullptr
+        );
+
+    SendMessageW(
+        button,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(g_font),
+        TRUE
+    );
+
+    return button;
+}
+
+// ============================================================
+// WINDOW PROCEDURE
+// ============================================================
+
+static LRESULT CALLBACK window_proc(
+    HWND hwnd,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam
+)
+{
+    switch (message)
+    {
+        case WM_CREATE:
+        {
+            g_main = hwnd;
+
+            g_font =
+                CreateFontW(
+                    -15,
+                    0,
+                    0,
+                    0,
+                    FW_NORMAL,
+                    FALSE,
+                    FALSE,
+                    FALSE,
+                    DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY,
+                    DEFAULT_PITCH |
+                    FF_DONTCARE,
+                    L"Segoe UI"
+                );
+
+            // ------------------------------------------------
+            // Navigation panel
+            // ------------------------------------------------
+
+            g_nav =
+                CreateWindowExW(
+                    0,
+                    L"STATIC",
+                    L"",
+                    WS_CHILD |
+                    WS_VISIBLE,
+                    0,
+                    0,
+                    195,
+                    720,
+                    hwnd,
+                    nullptr,
+                    nullptr,
+                    nullptr
+                );
+
+            make_nav_button(
+                g_nav,
+                L"Processes",
+                3001,
+                85
+            );
+
+            make_nav_button(
+                g_nav,
+                L"Performance",
+                3002,
+                135
+            );
+
+            make_nav_button(
+                g_nav,
+                L"Users",
+                3003,
+                185
+            );
+
+            make_nav_button(
+                g_nav,
+                L"Details",
+                3004,
+                235
+            );
+
+            make_nav_button(
+                g_nav,
+                L"Services",
+                3005,
+                285
+            );
+
+            // ------------------------------------------------
+            // Search
+            // ------------------------------------------------
+
+            g_search =
+                CreateWindowExW(
+                    WS_EX_CLIENTEDGE,
+                    L"EDIT",
+                    L"",
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    ES_AUTOHSCROLL,
+                    215,
+                    60,
+                    330,
+                    34,
+                    hwnd,
+                    reinterpret_cast<HMENU>(1001),
+                    nullptr,
+                    nullptr
+                );
+
+            SendMessageW(
+                g_search,
+                WM_SETFONT,
+                reinterpret_cast<WPARAM>(g_font),
+                TRUE
+            );
+
+            // ------------------------------------------------
+            // Refresh
+            // ------------------------------------------------
+
+            g_refresh =
+                CreateWindowExW(
+                    0,
+                    L"BUTTON",
+                    L"Refresh",
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    BS_PUSHBUTTON,
+                    555,
+                    60,
+                    100,
+                    34,
+                    hwnd,
+                    reinterpret_cast<HMENU>(1002),
+                    nullptr,
+                    nullptr
+                );
+
+            SendMessageW(
+                g_refresh,
+                WM_SETFONT,
+                reinterpret_cast<WPARAM>(g_font),
+                TRUE
+            );
+
+            // ------------------------------------------------
+            // ListView
+            // ------------------------------------------------
+
+            g_list =
+                CreateWindowExW(
+                    WS_EX_CLIENTEDGE,
+                    WC_LISTVIEWW,
+                    L"",
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    LVS_REPORT |
+                    LVS_SINGLESEL |
+                    LVS_SHOWSELALWAYS,
+                    215,
+                    110,
+                    900,
+                    500,
+                    hwnd,
+                    reinterpret_cast<HMENU>(1003),
+                    GetModuleHandleW(nullptr),
+                    nullptr
+                );
+
+            SendMessageW(
+                g_list,
+                WM_SETFONT,
+                reinterpret_cast<WPARAM>(g_font),
+                TRUE
+            );
+
+            ListView_SetExtendedListViewStyle(
+                g_list,
+                LVS_EX_FULLROWSELECT |
+                LVS_EX_GRIDLINES |
+                LVS_EX_DOUBLEBUFFER
+            );
+
+            list_insert_column(
+                0,
+                L"Name",
+                310
+            );
+
+            list_insert_column(
+                1,
+                L"PID",
+                85
+            );
+
+            list_insert_column(
+                2,
+                L"Parent PID",
+                105
+            );
+
+            list_insert_column(
+                3,
+                L"CPU",
+                90
+            );
+
+            list_insert_column(
+                4,
+                L"Memory",
+                125
+            );
+
+            list_insert_column(
+                5,
+                L"Status",
+                130
+            );
+
+            // ------------------------------------------------
+            // Status
+            // ------------------------------------------------
+
+            g_status =
+                CreateWindowExW(
+                    0,
+                    L"STATIC",
+                    L"Starting Tasklet...",
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    SS_LEFT,
+                    215,
+                    625,
+                    850,
+                    28,
+                    hwnd,
+                    reinterpret_cast<HMENU>(1004),
+                    nullptr,
+                    nullptr
+                );
+
+            SendMessageW(
+                g_status,
+                WM_SETFONT,
+                reinterpret_cast<WPARAM>(g_font),
+                TRUE
+            );
+
+            // ------------------------------------------------
+            // First data load
+            // ------------------------------------------------
+
+            g_processes =
+                enumerate_processes();
+
+            build_initial_view();
+
+            g_previous_search =
+                get_search_text();
+
+            SetTimer(
+                hwnd,
+                1,
+                1000,
+                nullptr
+            );
+
+            return 0;
+        }
+
+        case WM_SIZE:
+        {
+            int width =
+                static_cast<int>(
+                    LOWORD(lParam)
+                );
+
+            int height =
+                static_cast<int>(
+                    HIWORD(lParam)
+                );
+
+            if (g_nav)
+            {
+                MoveWindow(
+                    g_nav,
+                    0,
+                    0,
+                    195,
+                    height,
+                    TRUE
+                );
+            }
+
+            if (g_search)
+            {
+                MoveWindow(
+                    g_search,
+                    215,
+                    60,
+                    (std::max)(
+                        180,
+                        width - 565
+                    ),
+                    34,
+                    TRUE
+                );
+            }
+
+            if (g_refresh)
+            {
+                MoveWindow(
+                    g_refresh,
+                    (std::max)(
+                        405,
+                        width - 545
+                    ),
+                    60,
+                    100,
+                    34,
+                    TRUE
+                );
+            }
+
+            if (g_list)
+            {
+                MoveWindow(
+                    g_list,
+                    215,
+                    110,
+                    (std::max)(
+                        450,
+                        width - 235
+                    ),
+                    (std::max)(
+                        250,
+                        height - 165
+                    ),
+                    TRUE
+                );
+            }
+
+            if (g_status)
+            {
+                MoveWindow(
+                    g_status,
+                    215,
+                    (std::max)(
+                        120,
+                        height - 42
+                    ),
+                    (std::max)(
+                        450,
+                        width - 235
+                    ),
+                    28,
+                    TRUE
+                );
+            }
+
+            return 0;
+        }
+
+        case WM_TIMER:
+        {
+            if (wParam == 1)
+                refresh_processes();
+
+            return 0;
+        }
+
+        case WM_COMMAND:
+        {
+            switch (LOWORD(wParam))
+            {
+                case 1001:
+                {
+                    if (HIWORD(wParam) ==
+                        EN_CHANGE)
+                    {
+                        refresh_processes();
+                    }
+
+                    return 0;
+                }
+
+                case 1002:
+                {
+                    refresh_processes();
+                    return 0;
+                }
+
+                case 3001:
+                {
+                    return 0;
+                }
+
+                case 3002:
+                {
+                    MessageBoxW(
+                        hwnd,
+                        L"Performance dashboard is next.",
+                        L"Tasklet",
+                        MB_OK |
+                        MB_ICONINFORMATION
+                    );
+
+                    return 0;
+                }
+
+                case 3003:
+                {
+                    MessageBoxW(
+                        hwnd,
+                        L"User/session monitoring is next.",
+                        L"Tasklet",
+                        MB_OK |
+                        MB_ICONINFORMATION
+                    );
+
+                    return 0;
+                }
+
+                case 3004:
+                {
+                    MessageBoxW(
+                        hwnd,
+                        L"Detailed process inspection is next.",
+                        L"Tasklet",
+                        MB_OK |
+                        MB_ICONINFORMATION
+                    );
+
+                    return 0;
+                }
+
+                case 3005:
+                {
+                    MessageBoxW(
+                        hwnd,
+                        L"Service monitoring is next.",
+                        L"Tasklet",
+                        MB_OK |
+                        MB_ICONINFORMATION
+                    );
+
+                    return 0;
+                }
+            }
+
+            return 0;
+        }
+
+        case WM_CONTEXTMENU:
+        {
+            if (
+                reinterpret_cast<HWND>(wParam)
+                == g_list
+            )
+            {
+                if (get_selected_pid() == 0)
+                    return 0;
+
+                HMENU menu =
+                    CreatePopupMenu();
+
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    2001,
+                    L"End Process"
+                );
+
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    2002,
+                    L"Refresh"
+                );
+
+                POINT point{};
+
+                point.x =
+                    static_cast<short>(
+                        LOWORD(lParam)
+                    );
+
+                point.y =
+                    static_cast<short>(
+                        HIWORD(lParam)
+                    );
+
+                if (point.x == -1 &&
+                    point.y == -1)
+                {
+                    RECT rect{};
+
+                    GetWindowRect(
+                        g_list,
+                        &rect
+                    );
+
+                    point.x =
+                        rect.left + 20;
+
+                    point.y =
+                        rect.top + 20;
+                }
+
+                int command =
+                    TrackPopupMenu(
+                        menu,
+                        TPM_RETURNCMD |
+                        TPM_RIGHTBUTTON,
+                        point.x,
+                        point.y,
+                        0,
+                        hwnd,
+                        nullptr
+                    );
+
+                DestroyMenu(menu);
+
+                if (command == 2001)
+                {
+                    end_selected_process(
+                        hwnd
+                    );
+                }
+                else if (command == 2002)
+                {
+                    refresh_processes();
+                }
+
+                return 0;
+            }
+
+            break;
+        }
+
+        case WM_DESTROY:
+        {
+            KillTimer(
+                hwnd,
+                1
+            );
+
+            if (g_font)
+                DeleteObject(g_font);
+
+            PostQuitMessage(0);
+
+            return 0;
+        }
+    }
+
+    return DefWindowProcW(
+        hwnd,
+        message,
+        wParam,
+        lParam
+    );
+}
+
+// ============================================================
+// ENTRY POINT
+// ============================================================
+
+int WINAPI wWinMain(
+    HINSTANCE hInstance,
+    HINSTANCE,
+    PWSTR,
+    int nCmdShow
+)
+{
+    INITCOMMONCONTROLSEX controls{};
+
+    controls.dwSize =
+        sizeof(controls);
+
+    controls.dwICC =
+        ICC_LISTVIEW_CLASSES;
+
+    InitCommonControlsEx(
+        &controls
+    );
+
+    const wchar_t className[] =
+        L"TaskletNativeWindow";
+
+    WNDCLASSW wc{};
+
+    wc.lpfnWndProc =
+        window_proc;
+
+    wc.hInstance =
+        hInstance;
+
+    wc.hCursor =
+        LoadCursorW(
+            nullptr,
+            MAKEINTRESOURCEW(IDC_ARROW)
+        );
+
+    wc.hbrBackground =
+        reinterpret_cast<HBRUSH>(
+            COLOR_WINDOW + 1
+        );
+
+    wc.lpszClassName =
+        className;
+
+    if (!RegisterClassW(&wc))
+        return 1;
+
+    HWND hwnd =
+        CreateWindowExW(
+            0,
+            className,
+            L"Tasklet",
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            1180,
+            760,
+            nullptr,
+            nullptr,
+            hInstance,
+            nullptr
+        );
+
+    if (!hwnd)
+        return 1;
+
+    ShowWindow(
+        hwnd,
+        nCmdShow
+    );
+
+    UpdateWindow(hwnd);
+
+    MSG message{};
+
+    while (
+        GetMessageW(
+            &message,
+            nullptr,
+            0,
+            0
+        ) > 0
+    )
+    {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+
+    return static_cast<int>(
+        message.wParam
+    );
+}
+
+
+
